@@ -84,79 +84,169 @@ object text {
         else if ((b & 0xf8) == 0xf0) 3 // leading byte of a 4 byte seq
         else -1 // continuation byte or garbage
 
-      /*
-       * Returns the length of an incomplete multi-byte sequence at the end of
-       * `bs`. If `bs` ends with an ASCII byte or a complete multi-byte sequence,
-       * 0 is returned.
-       */
-      def lastIncompleteBytes(bs: Array[Byte]): Int = {
-        /*
-         * This is logically the same as this
-         * code, but written in a low level way
-         * to avoid any allocations and just do array
-         * access
-         *
-         *
-         *
-          val lastThree = bs.drop(0.max(bs.size - 3)).toArray.reverseIterator
-          lastThree
-            .map(continuationBytes)
-            .zipWithIndex
-            .find {
-              case (c, _) => c >= 0
-            }
-            .map {
-              case (c, i) => if (c == i) 0 else i + 1
-            }
-            .getOrElse(0)
+      // /*
+      //  * Returns the length of an incomplete multi-byte sequence at the end of
+      //  * `bs`. If `bs` ends with an ASCII byte or a complete multi-byte sequence,
+      //  * 0 is returned.
+      //  */
+      // def lastIncompleteBytes(bs: Array[Byte]): Int = {
+      //   /*
+      //    * This is logically the same as this
+      //    * code, but written in a low level way
+      //    * to avoid any allocations and just do array
+      //    * access
+      //    *
+      //    *
+      //    *
+      //     val lastThree = bs.drop(0.max(bs.size - 3)).toArray.reverseIterator
+      //     lastThree
+      //       .map(continuationBytes)
+      //       .zipWithIndex
+      //       .find {
+      //         case (c, _) => c >= 0
+      //       }
+      //       .map {
+      //         case (c, i) => if (c == i) 0 else i + 1
+      //       }
+      //       .getOrElse(0)
 
-         */
+      //    */
 
-        val minIdx = 0.max(bs.length - 3)
-        var idx = bs.length - 1
-        var counter = 0
-        var res = 0
-        while (minIdx <= idx) {
-          val c = continuationBytes(bs(idx))
-          if (c >= 0) {
-            if (c != counter)
-              res = counter + 1
-            // exit the loop
-            return res
-          }
-          idx = idx - 1
-          counter = counter + 1
+      //   val minIdx = 0.max(bs.length - 3)
+      //   var idx = bs.length - 1
+      //   var counter = 0
+      //   var res = 0
+      //   while (minIdx <= idx) {
+      //     val c = continuationBytes(bs(idx))
+      //     if (c >= 0) {
+      //       if (c != counter)
+      //         res = counter + 1
+      //       // exit the loop
+      //       return res
+      //     }
+      //     idx = idx - 1
+      //     counter = counter + 1
+      //   }
+      //   res
+      // }
+
+      // TODO have a size hint constructor
+      class ByteStack(startingSize: Int) {
+        require((startingSize & (startingSize - 1)) == 0, "startingSize must be a power of two")
+        private[this] var length = 0
+        private[this] var buffer = new Array[Byte](startingSize)
+
+        def size = length
+        def nonEmpty: Boolean = length != 0
+
+        def addChunk(c: Chunk[Byte]): Unit = {
+          addAndGrow(c)
+          // println(s"CHUNK ADDED, INCREASING LENGTH $length -> ${length + c.size}")
+          length += c.size
         }
-        res
+
+        // name better
+        def splitString(): Option[String] = {
+          val splitAt = length - lastIncompleteBytes
+          if (splitAt == length) {
+            val str = new String(buffer, 0, length, utf8Charset)
+            length = 0
+            Some(str)
+          } else if (splitAt == 0) {
+            None
+          } else {
+            val str = new String(buffer.take(splitAt), utf8Charset)
+            // Move remaining bytes to beginning of array
+            System.arraycopy(buffer, splitAt, buffer, 0, length - splitAt)
+            length = length - splitAt
+            Some(str)
+          }
+        }
+
+        def remainderString(): String =
+          new String(buffer, 0, length, utf8Charset)
+
+        def lastIncompleteBytes: Int = {
+          val minIdx = 0.max(length - 3)
+          var idx = length - 1
+          var counter = 0
+          var res = 0
+          while (minIdx <= idx) {
+            val c = continuationBytes(buffer(idx))
+            if (c >= 0) {
+              if (c != counter)
+                res = counter + 1
+              // exit the loop
+              return res
+            }
+            idx = idx - 1
+            counter = counter + 1
+          }
+          res
+        }
+
+        private[this] def addAndGrow(c: Chunk[Byte]): Unit = {
+          val newSize = length + c.size
+          if (newSize < buffer.length) {
+            // println(s"NOT GROWING: Current size is ${buffer.length}, length is $length, newSize is $newSize")
+            c.copyToArray(buffer, start = length)
+          } else {
+            val nextPowerTwo = 1 << Integer.SIZE - Integer.numberOfLeadingZeros(newSize)
+            println(s"GROWING ARRAY: Current size is ${buffer.length}, length is $length, growing to $nextPowerTwo")
+            val buffer2 = new Array[Byte](nextPowerTwo)
+            System.arraycopy(buffer, 0, buffer2, 0, length)
+            c.copyToArray(buffer2, start = length)
+            buffer = buffer2
+          }
+        }
       }
 
       def processSingleChunk(
           bldr: Builder[String, List[String]],
-          buffer: Chunk[Byte],
+          byteStack: ByteStack,
           nextBytes: Chunk[Byte]
-      ): Chunk[Byte] = {
-        // if processing ASCII or largely ASCII buffer is often empty
-        val allBytes =
-          if (buffer.isEmpty) nextBytes.toArray
-          else Array.concat(buffer.toArray, nextBytes.toArray)
-
-        val splitAt = allBytes.length - lastIncompleteBytes(allBytes)
-
-        if (splitAt == allBytes.length) {
-          // in the common case of ASCII chars
-          // we are in this branch so the next buffer will
-          // be empty
-          bldr += new String(allBytes, utf8Charset)
-          Chunk.empty
-        } else if (splitAt == 0)
-          Chunk.array(allBytes)
-        else {
-          bldr += new String(allBytes.take(splitAt), utf8Charset)
-          Chunk.array(allBytes.drop(splitAt))
-        }
+      ): ByteStack = {
+        byteStack.addChunk(nextBytes)
+        byteStack.splitString().foreach(bldr.addOne)
+        byteStack
       }
 
-      def doPull(buf: Chunk[Byte], s: Stream[F, Chunk[Byte]]): Pull[F, String, Unit] =
+      // def processSingleChunkOld(
+      //     bldr: Builder[String, List[String]],
+      //     buffer: ArrayBuffer[Byte],
+      //     nextBytes: Chunk[Byte]
+      // ): ArrayBuffer[Byte] = {
+      //   // if processing ASCII or largely ASCII buffer is often empty
+      //   // val allBytes =
+      //   //   if (buffer.isEmpty) nextBytes.toArray
+      //   //   else Array.concat(buffer.toArray, nextBytes.toArray)
+      //   val allBytes =
+      //     if (buffer.length == 0) nextBytes.toArray
+      //     else {
+      //       val arr = buffer.toArray
+      //       arr ++ nextBytes.toArray
+      //     }
+
+      //   val splitAt = allBytes.length - lastIncompleteBytes(allBytes)
+
+      //   if (splitAt == allBytes.length) {
+      //     // in the common case of ASCII chars
+      //     // we are in this branch so the next buffer will
+      //     // be empty
+      //     bldr += new String(allBytes, utf8Charset)
+      //     //Chunk.empty
+      //     buffer.empty
+      //   } else if (splitAt == 0)
+      //     //Chunk.array(allBytes)
+      //     ArrayBuffer.from(allBytes)
+      //   else {
+      //     bldr += new String(allBytes.take(splitAt), utf8Charset)
+      //     //Chunk.array(allBytes.drop(splitAt))
+      //     ArrayBuffer.from(allBytes.drop(splitAt))
+      //   }
+      // }
+
+      def doPull(buf: ByteStack, s: Stream[F, Chunk[Byte]]): Pull[F, String, Unit] =
         s.pull.uncons.flatMap {
           case Some((byteChunks, tail)) =>
             // use local and private mutability here
@@ -171,7 +261,7 @@ object text {
             }
             Pull.output(Chunk.from(bldr.result())) >> doPull(buf1, tail)
           case None if buf.nonEmpty =>
-            Pull.output1(new String(buf.toArray, utf8Charset))
+            Pull.output1(buf.remainderString())
           case None =>
             Pull.done
         }
@@ -191,13 +281,13 @@ object text {
               val rem =
                 if (newBuffer.startsWith(Chunk.byteVector(bom.utf8))) newBuffer.drop(3)
                 else newBuffer
-              doPull(Chunk.empty, Stream.emits(rem.chunks) ++ tl)
+              doPull(new ByteStack(32), Stream.emits(rem.chunks) ++ tl)
             } else if (newBuffer.startsWith(Chunk.byteVector(bom.utf8.take(newBuffer.size.toLong))))
               processByteOrderMark(newBuffer, tl)
-            else doPull(Chunk.empty, Stream.emits(newBuffer.chunks) ++ tl)
+            else doPull(new ByteStack(32), Stream.emits(newBuffer.chunks) ++ tl)
           case None =>
             if (buffer ne null)
-              doPull(Chunk.empty, Stream.emits(buffer.chunks))
+              doPull(new ByteStack(32), Stream.emits(buffer.chunks))
             else Pull.done
         }
 
